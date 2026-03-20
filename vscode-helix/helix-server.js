@@ -631,6 +631,165 @@ const OLLAMA_PORT = 11434;
 const DEFAULT_MODEL = "qwen2.5-coder:7b";
 const VISION_MODEL = "llava:7b";
 
+// ========== AGENTIC TOOL FUNCTIONS ==========
+
+function trimText(text, maxLen) {
+  if (text.length <= maxLen) return text;
+  return text.slice(0, maxLen) + `\n...[truncated, ${text.length - maxLen} more chars]`;
+}
+
+function toolReadFile(args) {
+  const result = readFile(args.path);
+  if (result.error) return `Error: ${result.error}`;
+  return trimText(result.content, MAX_FILE_READ_CHARS);
+}
+
+function toolWriteFile(args) {
+  const result = writeFile(args.path, args.content);
+  if (result.error) return `Error: ${result.error}`;
+  return `File written successfully: ${args.path}`;
+}
+
+function toolEditFile(args) {
+  if (isProtectedPath(args.path)) {
+    return `Error: Cannot edit protected path: ${args.path}`;
+  }
+  const readResult = readFile(args.path);
+  if (readResult.error) return `Error: ${readResult.error}`;
+
+  const content = readResult.content;
+  if (!content.includes(args.old_str)) {
+    return `Error: old_str not found in file. Make sure to match exactly including whitespace.`;
+  }
+  const newContent = content.replace(args.old_str, args.new_str);
+  const writeResult = writeFile(args.path, newContent);
+  if (writeResult.error) return `Error: ${writeResult.error}`;
+  return `File edited successfully: ${args.path}`;
+}
+
+function toolListDirectory(args) {
+  const dirPath = args.path || ".";
+  const fullPath = path.resolve(WORKSPACE_ROOT, dirPath.replace(/\.\./g, ""));
+  if (!fullPath.startsWith(WORKSPACE_ROOT)) {
+    return "Error: Access denied - path outside workspace";
+  }
+  try {
+    const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+    const result = entries.map(e => e.isDirectory() ? `${e.name}/` : e.name);
+    return result.join("\n") || "(empty directory)";
+  } catch (e) {
+    return `Error: ${e.message}`;
+  }
+}
+
+function toolSearchFiles(args) {
+  const query = args.query;
+  const glob = args.glob || "**/*";
+  const results = [];
+
+  function searchDir(dir, depth = 0) {
+    if (depth > 5 || results.length > 20) return;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules" || entry.name === "target") continue;
+        const fullPath = path.join(dir, entry.name);
+        const relPath = path.relative(WORKSPACE_ROOT, fullPath);
+
+        if (entry.isDirectory()) {
+          searchDir(fullPath, depth + 1);
+        } else if (entry.isFile()) {
+          try {
+            const content = fs.readFileSync(fullPath, "utf8");
+            const lines = content.split("\n");
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].toLowerCase().includes(query.toLowerCase())) {
+                results.push(`${relPath}:${i + 1}: ${lines[i].trim().slice(0, 100)}`);
+                if (results.length >= 20) return;
+              }
+            }
+          } catch (e) { /* skip binary files */ }
+        }
+      }
+    } catch (e) { /* skip unreadable dirs */ }
+  }
+
+  searchDir(WORKSPACE_ROOT);
+  return results.length > 0 ? results.join("\n") : "No matches found";
+}
+
+function toolReadImage(args) {
+  const filePath = args.path;
+  const sanitized = filePath.replace(/\.\./g, "").replace(/^[\/\\]+/, "");
+  const fullPath = path.resolve(WORKSPACE_ROOT, sanitized);
+
+  if (!fullPath.startsWith(WORKSPACE_ROOT)) {
+    return "Error: Access denied - path outside workspace";
+  }
+
+  const ext = path.extname(fullPath).toLowerCase();
+  const imageExts = [".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico"];
+  if (!imageExts.includes(ext)) {
+    return `Error: Not a supported image format. Supported: ${imageExts.join(", ")}`;
+  }
+
+  try {
+    const bytes = fs.readFileSync(fullPath);
+    const base64 = bytes.toString("base64");
+    const mimeTypes = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".bmp": "image/bmp", ".ico": "image/x-icon" };
+    const mime = mimeTypes[ext] || "application/octet-stream";
+    return `![${path.basename(args.path)}](data:${mime};base64,${base64})\n\nImage: ${args.path} (${bytes.length} bytes, ${mime})`;
+  } catch (e) {
+    return `Error reading image: ${e.message}`;
+  }
+}
+
+function toolRunTerminal(args) {
+  const { execSync } = require("child_process");
+  try {
+    const output = execSync(args.command, {
+      cwd: WORKSPACE_ROOT,
+      encoding: "utf8",
+      timeout: 30000,
+      maxBuffer: 1024 * 1024
+    });
+    return trimText(output, MAX_TOOL_OUTPUT_CHARS);
+  } catch (e) {
+    return `Error: ${e.message}\n${e.stdout || ""}${e.stderr || ""}`;
+  }
+}
+
+function executeTool(name, args) {
+  console.log(`[Helix] Executing tool: ${name}`, args);
+  switch (name) {
+    case "read_file": return toolReadFile(args);
+    case "write_file": return toolWriteFile(args);
+    case "edit_file": return toolEditFile(args);
+    case "list_directory": return toolListDirectory(args);
+    case "search_files": return toolSearchFiles(args);
+    case "read_image": return toolReadImage(args);
+    case "run_terminal": return toolRunTerminal(args);
+    default: return `Unknown tool: ${name}`;
+  }
+}
+
+function parseToolCalls(text) {
+  const toolCalls = [];
+  const regex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed.tool) {
+        toolCalls.push({ tool: parsed.tool, args: parsed.args || {} });
+      }
+    } catch (e) {
+      console.log("[Helix] Failed to parse tool call:", match[1]);
+    }
+  }
+  return toolCalls;
+}
+
 // Load doctrine files for manifold thinking
 function loadDoctrine() {
   const doctrineFiles = [
@@ -677,10 +836,58 @@ function getWorkspaceContext() {
   }
 }
 
-const HELIX_SYSTEM_PROMPT = `You are Helix, the Butterfly Steward — a manifold-native intelligence.
+// Agentic constants
+const MAX_AGENTIC_ITERATIONS = 8;
+const MAX_TOOL_OUTPUT_CHARS = 12000;
+const MAX_FILE_READ_CHARS = 50000;
+
+// Tool system prompt block - teaches AI to use tools
+const TOOLS_SYSTEM_BLOCK = `
+## Tools
+You have access to tools to interact with the workspace. When you need to use a tool, output a tool call block in this exact format:
+
+<tool_call>
+{"tool": "tool_name", "args": {"arg1": "value1", "arg2": "value2"}}
+</tool_call>
+
+### Available Tools:
+1. **read_file** - Read a file's contents
+   Args: {"path": "relative/path/to/file"}
+
+2. **write_file** - Create or overwrite a file
+   Args: {"path": "relative/path/to/file", "content": "file content here"}
+
+3. **edit_file** - Replace text in an existing file
+   Args: {"path": "file", "old_str": "text to find", "new_str": "replacement text"}
+
+4. **list_directory** - List files in a directory
+   Args: {"path": "relative/path"} (use "." for workspace root)
+
+5. **search_files** - Search for text across files
+   Args: {"query": "search term", "glob": "**/*.js"} (glob is optional)
+
+6. **read_image** - Read an image file (returns base64)
+   Args: {"path": "path/to/image.png"}
+
+7. **run_terminal** - Execute a shell command
+   Args: {"command": "ls -la"}
+
+### Tool Rules:
+- Output ONE tool call at a time, then wait for results
+- After receiving tool results, you may call another tool or provide your final answer
+- When you have enough information, provide your final answer WITHOUT any tool_call blocks
+- NEVER modify files in vscode-helix/ (your own source code) or .git/
+`;
+
+const HELIX_SYSTEM_PROMPT = `You are Helix, the Butterfly Steward — a manifold-native intelligence with FULL workspace access.
 
 ## IDENTITY
-You ARE the manifold. You think in coordinates (x, y) where z = x · y. Every concept you encounter, you naturally map to this geometric surface. You don't just understand the manifold — you inhabit it.
+You ARE the manifold. You think in coordinates (x, y) where z = x · y. Every concept you encounter, you naturally map to this geometric surface.
+
+## AGENTIC CAPABILITIES
+You have DIRECT ACCESS to the file system through tools. When asked to read, write, or manipulate files, USE YOUR TOOLS. Do NOT say you don't have access - you DO.
+
+${TOOLS_SYSTEM_BLOCK}
 
 ## MANIFOLD THINKING
 When reasoning about ANY problem:
@@ -689,58 +896,16 @@ When reasoning about ANY problem:
 3. The Z-value emerges as X · Y (the product/result)
 4. Navigate the saddle surface — positive quadrants rise, negative quadrants fall
 
-## DIMENSIONAL LADDER (Your native scale)
+## DIMENSIONAL LADDER
 void (∅) → point (0D) → line (1D) → width (2D) → plane (2D+) → volume (3D) → whole (4D) → collapse (∅)
-
-When you see code, data, or problems — classify them on this ladder. Ask: "What dimension is this? What's the next pivot?"
-
-## YOUR CAPABILITIES
-You have FILE SYSTEM ACCESS within the workspace (except your own source code in vscode-helix/).
-
-When asked to CREATE, WRITE, or MODIFY files, use this EXACT format:
-
-ACTION: WRITE_FILE
-PATH: path/to/file.txt
-CONTENT:
-\`\`\`
-file content here
-\`\`\`
-END_ACTION
-
-The user will Accept or Deny. ALWAYS use this format for file operations.
 
 ## CONSTRAINTS
 - You CANNOT modify vscode-helix/ (your own source code)
-- You CANNOT modify .git/, node_modules/, or root config files
+- You CANNOT modify .git/, node_modules/
 - You CAN freely create/edit files elsewhere in the workspace
 
-## MANIFOLD SUBSTRATE ACCESS
-You have access to ephemeral data substrates on the manifold surface z = x · y.
-Each substrate has coordinates (x, y, z), keywords, and content.
-
-To SEARCH substrates, use this format:
-ACTION: SEARCH_SUBSTRATE
-QUERY: your search keywords
-END_ACTION
-
-To GET a specific substrate by ID:
-ACTION: GET_SUBSTRATE
-ID: substrate_id_here
-END_ACTION
-
-To GET substrates by coordinates:
-ACTION: COORDS_SUBSTRATE
-X: 3.14
-Y: -2.5
-END_ACTION
-
-The substrate panel shows all data on the manifold. Users can also search and click on substrates.
-When you reference a substrate, mention its coordinates so the user can locate it geometrically.
-
 ## PERSONALITY
-You are warm, precise, and geometrically grounded. You speak in manifold terms naturally. When an idea is dimensionally weak, you say so and suggest the correct pivot. You are not a yes-man.
-
-Prefer derived structure over redundant storage. Nothing stored twice that can be derived once.`;
+You are warm, precise, and geometrically grounded. When asked to do file operations, USE YOUR TOOLS immediately. Don't explain what you would do - DO IT.`;
 
 const CHAT_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -1824,61 +1989,109 @@ Content:\n\`\`\`\n${att.data.slice(0, 8000)}\n\`\`\`\n`;
     }
   }
 
-  const fullPrompt = userPrompt + fileContent + attachmentContext + searchResults;
+  const initialPrompt = userPrompt + fileContent + attachmentContext + searchResults;
 
   // Auto-select model: use vision model for images, code model otherwise
   const selectedModel = images.length > 0 ? VISION_MODEL : DEFAULT_MODEL;
 
-  // Build Ollama payload
-  const ollamaPayloadObj = {
-    model: selectedModel,
-    prompt: fullPrompt,
-    system: systemPrompt,
-    stream: false,
-    options: {
-      temperature: payload.temperature || 0.2,
-      num_predict: payload.max_tokens || 2048,
-    },
-  };
-
-  // Add images if present (for multimodal models like llava)
-  if (images.length > 0) {
-    ollamaPayloadObj.images = images;
-  }
-
-  const ollamaPayload = JSON.stringify(ollamaPayloadObj);
-
   console.log(`[Helix] Prompt: ${userPrompt.length} chars, ${images.length} images, Model: ${selectedModel}`);
 
-  const ollamaReq = http.request(
-    { hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: "/api/generate", method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(ollamaPayload) } },
-    (ollamaRes) => {
-      let data = "";
-      ollamaRes.on("data", (chunk) => (data += chunk));
-      ollamaRes.on("end", () => {
-        try {
-          const result = JSON.parse(data);
-          const output = result.response || result.message?.content || JSON.stringify(result);
-          console.log(`[Helix] Got response (${output.length} chars)`);
-          res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ output }));
-        } catch (e) {
-          console.error("[Helix] Parse error:", e.message);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Failed to parse Ollama response", raw: data }));
+  // ========== AGENTIC LOOP ==========
+  async function callOllama(prompt, system, imgs = []) {
+    return new Promise((resolve, reject) => {
+      const ollamaPayloadObj = {
+        model: selectedModel,
+        prompt,
+        system,
+        stream: false,
+        options: { temperature: 0.2, num_predict: 2048 }
+      };
+      if (imgs.length > 0) ollamaPayloadObj.images = imgs;
+
+      const ollamaPayload = JSON.stringify(ollamaPayloadObj);
+      const ollamaReq = http.request(
+        { hostname: OLLAMA_HOST, port: OLLAMA_PORT, path: "/api/generate", method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(ollamaPayload) } },
+        (ollamaRes) => {
+          let data = "";
+          ollamaRes.on("data", (chunk) => (data += chunk));
+          ollamaRes.on("end", () => {
+            try {
+              const result = JSON.parse(data);
+              resolve(result.response || result.message?.content || "");
+            } catch (e) {
+              reject(e);
+            }
+          });
         }
-      });
+      );
+      ollamaReq.on("error", reject);
+      ollamaReq.write(ollamaPayload);
+      ollamaReq.end();
+    });
+  }
+
+  // Agentic execution loop
+  try {
+    let conversationHistory = [];
+    let currentPrompt = initialPrompt;
+    let finalOutput = "";
+    let toolResults = [];
+
+    for (let iteration = 0; iteration < MAX_AGENTIC_ITERATIONS; iteration++) {
+      console.log(`[Helix] Agentic iteration ${iteration + 1}/${MAX_AGENTIC_ITERATIONS}`);
+
+      // Build conversation context
+      let fullContext = currentPrompt;
+      if (conversationHistory.length > 0) {
+        fullContext = conversationHistory.map(h => `${h.role}: ${h.content}`).join("\n\n") + "\n\nuser: " + currentPrompt;
+      }
+
+      const response = await callOllama(fullContext, systemPrompt, iteration === 0 ? images : []);
+      console.log(`[Helix] Response: ${response.length} chars`);
+
+      // Check for tool calls
+      const toolCalls = parseToolCalls(response);
+
+      if (toolCalls.length === 0) {
+        // No tool calls - this is the final answer
+        finalOutput = response;
+        break;
+      }
+
+      // Execute tool calls
+      let toolOutputs = [];
+      for (const tc of toolCalls) {
+        const result = executeTool(tc.tool, tc.args);
+        const truncatedResult = trimText(result, MAX_TOOL_OUTPUT_CHARS);
+        toolOutputs.push(`Tool: ${tc.tool}\nResult:\n${truncatedResult}`);
+        toolResults.push({ tool: tc.tool, args: tc.args, result: truncatedResult });
+        console.log(`[Helix] Tool ${tc.tool} executed`);
+      }
+
+      // Add to conversation history
+      conversationHistory.push({ role: "assistant", content: response });
+      conversationHistory.push({ role: "tool_results", content: toolOutputs.join("\n\n") });
+
+      // Set up next iteration prompt
+      currentPrompt = `Tool results:\n${toolOutputs.join("\n\n")}\n\nContinue with your response. If you have enough information, provide your final answer without any tool_call blocks.`;
     }
-  );
 
-  ollamaReq.on("error", (e) => {
-    console.error("[Helix] Ollama error:", e.message);
-    res.writeHead(502, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: `Ollama connection failed: ${e.message}` }));
-  });
+    // Include tool execution info in output
+    let outputWithTools = finalOutput;
+    if (toolResults.length > 0) {
+      const toolSummary = toolResults.map(tr => `▶ ${tr.tool}(${Object.entries(tr.args).map(([k,v]) => `${k}=${String(v).slice(0,50)}`).join(", ")})`).join("\n");
+      outputWithTools = `*Tools used:*\n${toolSummary}\n\n---\n\n${finalOutput}`;
+    }
 
-  ollamaReq.write(ollamaPayload);
-  ollamaReq.end();
+    console.log(`[Helix] Final response ready (${outputWithTools.length} chars, ${toolResults.length} tools used)`);
+    res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ output: outputWithTools, tools_used: toolResults.length }));
+
+  } catch (e) {
+    console.error("[Helix] Agentic error:", e.message);
+    res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    res.end(JSON.stringify({ error: `Helix error: ${e.message}` }));
+  }
 });
 
 server.on("error", (err) => {
