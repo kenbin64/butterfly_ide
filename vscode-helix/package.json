@@ -1,0 +1,68 @@
+{
+  "name": "butterfly-helix-vscode",
+  "displayName": "Butterfly Helix",
+  "description": "Local-first Butterfly Helix chat and editor-aware coding surface for VS Code.",
+  "version": "0.0.1",
+  "publisher": "butterfly-local",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onView:helix.chatView",
+    "onCommand:helix.openChat",
+    "onCommand:helix.exportHandoff"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "helix.openChat",
+        "title": "Butterfly Helix: Open Chat"
+      },
+      {
+        "command": "helix.exportHandoff",
+        "title": "Butterfly Helix: Export Mentor Handoff"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "helix",
+          "title": "Butterfly Helix",
+          "icon": "media/helix.svg"
+        }
+      ]
+    },
+    "views": {
+      "helix": [
+        {
+          "type": "webview",
+          "id": "helix.chatView",
+          "name": "Butterfly Helix Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Butterfly Helix",
+      "properties": {
+        "helix.endpointUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:9000/model/invoke",
+          "description": "Local or tunneled Helix invoke endpoint used by the VS Code chat surface."
+        },
+        "helix.systemPrompt": {
+          "type": "string",
+          "default": "You are Helix, the Butterfly Steward. Act as a local-first autonomous software engineer. Stay constitutional, operator-first, manifold-native, substrate-grounded, and good at debugging.",
+          "description": "System prompt sent from the VS Code Helix chat surface."
+        },
+        "helix.maxTokens": {
+          "type": "number",
+          "default": 2048,
+          "minimum": 64,
+          "description": "Maximum tokens requested by the VS Code Helix chat surface."
+        }
+      }
+    }
+  }
+}

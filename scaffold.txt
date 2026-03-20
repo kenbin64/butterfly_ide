@@ -1,0 +1,26 @@
+butterfly-ide/
+│
+├── src/                     ← React frontend
+│   ├── assets/
+│   ├── App.css
+│   ├── App.tsx
+│   ├── main.tsx
+│   └── vite-env.d.ts
+│
+├── src-tauri/               ← Tauri shell
+│   ├── capabilities/
+│   ├── gen/
+│   ├── icons/
+│   └── src/
+│       └── main.rs          ← tiny launcher
+│
+└── butterfly_ide_lib/       ← backend Rust library
+    ├── Cargo.toml
+    └── src/
+        ├── lib.rs
+        └── command/
+            ├── mod.rs
+            ├── bus.rs
+            ├── handler.rs
+            ├── command.rs?         ← optional
+            └── system_handler.rs?  ← optional
